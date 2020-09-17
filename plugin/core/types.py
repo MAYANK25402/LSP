@@ -1,7 +1,10 @@
+from os import pathconf
 from .collections import DottedDict
 from .logging import debug
 from .protocol import TextDocumentSyncKindNone
 from .typing import Any, Optional, List, Dict, Generator, Callable, Iterable, Union, Set, TypeVar, Tuple
+from .url import filename_to_uri
+from .url import uri_to_filename
 from threading import RLock
 from wcmatch.glob import BRACE
 from wcmatch.glob import globmatch
@@ -486,6 +489,56 @@ class Capabilities(DottedDict):
         return "textDocumentSync.didClose" in self
 
 
+def _translate_path(path: str, source: str, destination: str) -> Tuple[str, bool]:
+    # TODO: Case-insensitive file systems. Maybe this problem needs a much larger refactor. Even Sublime Text doesn't
+    # handle case-insensitive file systems correctly. There are a few other places where case-sensitivity matters, for
+    # example when looking up the correct view for diagnostics, and when finding a view for goto-def.
+    if path.startswith(source):
+        return path.replace(source, destination, 1), True
+    return path, False
+
+
+class PathMap:
+
+    __slots__ = ("_local", "_remote")
+
+    def __init__(self, local: str, remote: str) -> None:
+        self._local = local
+        self._remote = remote
+
+    @classmethod
+    def parse(cls, json: Any) -> "Optional[List[PathMap]]":
+        if not isinstance(json, list):
+            return None
+        result = []  # type: List[PathMap]
+        for path_map in json:
+            if not isinstance(path_map, dict):
+                debug('path map entry is not an object')
+                continue
+            local = path_map.get("local")
+            if not isinstance(local, str):
+                debug('missing "local" key for path map entry')
+                continue
+            remote = path_map.get("remote")
+            if not isinstance(remote, str):
+                debug('missing "remote" key for path map entry')
+                continue
+            result.append(PathMap(local, remote))
+        return result
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, PathMap):
+            return False
+        return self._local == other._local and \
+               self._remote == other._remote
+
+    def map_from_local_to_remote(self, uri: str) -> Tuple[str, bool]:
+        return _translate_path(uri, self._local, self._remote)
+
+    def map_from_remote_to_local(self, uri: str) -> Tuple[str, bool]:
+        return _translate_path(uri, self._remote, self._local)
+
+
 class ClientConfig:
     def __init__(self,
                  name: str,
@@ -497,7 +550,8 @@ class ClientConfig:
                  init_options: DottedDict = DottedDict(),
                  settings: DottedDict = DottedDict(),
                  env: Dict[str, str] = {},
-                 experimental_capabilities: Optional[Dict[str, Any]] = None) -> None:
+                 experimental_capabilities: Optional[Dict[str, Any]] = None,
+                 path_maps: Optional[List[PathMap]] = None) -> None:
         self.name = name
         if isinstance(command, list):
             self.command = command
@@ -512,6 +566,7 @@ class ClientConfig:
         self.env = env
         self.experimental_capabilities = experimental_capabilities
         self.status_key = "lsp_{}".format(self.name)
+        self.path_maps = path_maps
 
     @classmethod
     def from_sublime_settings(cls, name: str, s: sublime.Settings, file: str) -> "ClientConfig":
@@ -530,7 +585,8 @@ class ClientConfig:
             init_options=init_options,
             settings=settings,
             env=read_dict_setting(s, "env", {}),
-            experimental_capabilities=s.get("experimental_capabilities")
+            experimental_capabilities=s.get("experimental_capabilities"),
+            path_maps=PathMap.parse(s.get("path_maps"))
         )
 
     @classmethod
@@ -544,24 +600,26 @@ class ClientConfig:
             init_options=DottedDict(d.get("initializationOptions")),
             settings=DottedDict(d.get("settings")),
             env=d.get("env", dict()),
-            experimental_capabilities=d.get("experimental_capabilities", dict())
+            experimental_capabilities=d.get("experimental_capabilities", dict()),
+            path_maps=PathMap.parse(d.get("path_maps"))
         )
 
-    def update(self, override: Dict[str, Any]) -> "ClientConfig":
-        languages = _read_language_configs(override)
+    def update(self, o: Dict[str, Any]) -> "ClientConfig":
+        languages = _read_language_configs(o)
         if not languages:
             languages = self.languages
+        path_map_override = PathMap.parse(o.get("path_maps"))
         return ClientConfig(
             name=self.name,
-            command=override.get("command", self.command),
+            command=o.get("command", self.command),
             languages=languages,
-            tcp_port=override.get("tcp_port", self.tcp_port),
-            enabled=override.get("enabled", self.enabled),
-            init_options=DottedDict.from_base_and_override(self.init_options, override.get("initializationOptions")),
-            settings=DottedDict.from_base_and_override(self.settings, override.get("settings")),
-            env=override.get("env", self.env),
-            experimental_capabilities=override.get(
-                "experimental_capabilities", self.experimental_capabilities)
+            tcp_port=o.get("tcp_port", self.tcp_port),
+            enabled=o.get("enabled", self.enabled),
+            init_options=DottedDict.from_base_and_override(self.init_options, o.get("initializationOptions")),
+            settings=DottedDict.from_base_and_override(self.settings, o.get("settings")),
+            env=o.get("env", self.env),
+            experimental_capabilities=o.get("experimental_capabilities", self.experimental_capabilities),
+            path_maps=path_map_override if path_map_override else self.path_maps
         )
 
     def set_view_status(self, view: sublime.View, message: str) -> None:
@@ -585,6 +643,29 @@ class ClientConfig:
             if score > highest_score:
                 highest_score = score
         return highest_score
+
+    def map_client_path_to_server_uri(self, path: str) -> str:
+        if self.path_maps:
+            for path_map in self.path_maps:
+                path, mapped = path_map.map_from_local_to_remote(path)
+                if mapped:
+                    break
+        return filename_to_uri(path)
+
+    def map_server_uri_to_client_path(self, uri: str) -> str:
+        path = uri_to_filename(uri)
+        if self.path_maps:
+            for path_map in self.path_maps:
+                path, mapped = path_map.map_from_remote_to_local(path)
+                if mapped:
+                    break
+        return path
+
+    def uri_from_view(self, view: sublime.View) -> str:
+        file_name = view.file_name()
+        if file_name:
+            return self.map_client_path_to_server_uri(file_name)
+        raise MissingFilenameError(view.id())
 
     def __repr__(self) -> str:
         items = []  # type: List[str]
